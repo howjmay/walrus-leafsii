@@ -1,0 +1,580 @@
+#[test_only]
+module leafsii::test_stability_pool_rewards {
+    use sui::clock::{Self, Clock};
+    use sui::coin::{Self, Coin};
+    use sui::test_scenario::{Self as ts, Scenario};
+
+    use oracle::oracle::{Self, MockOracle};
+    use leafsii::leafsii::{Self, Protocol};
+    use leafsii::stability_pool::{Self, StabilityPool};
+
+    // Test asset types
+    public struct TEST_RESERVE has drop {}
+    public struct TEST_FTOKEN has drop {}
+    public struct TEST_XTOKEN has drop {}
+
+    const INITIAL_PRICE_E6: u64 = 2_000_000; // $2.00
+    const DEPOSIT_AMOUNT: u64 = 1_000_000; // 1 TEST_RESERVE
+    const SCALE_FACTOR: u64 = 1_000_000_000; // Use 1e9 to match implementation
+
+    fun setup_protocol_with_sp(scenario: &mut Scenario, clock: &Clock): (Coin<TEST_FTOKEN>, Coin<TEST_XTOKEN>, leafsii::AdminCap, stability_pool::StabilityPoolAdminCap) {
+        let ctx = ts::ctx(scenario);
+
+        // Create stability pool first
+        let sp_cap = stability_pool::create_stability_pool<TEST_RESERVE, TEST_FTOKEN>(ctx);
+
+        ts::next_tx(scenario, @0x1);
+        let mut pool = ts::take_shared<StabilityPool<TEST_RESERVE, TEST_FTOKEN>>(scenario);
+
+        // Create protocol with pool reference
+        let stable_treasury_cap = coin::create_treasury_cap_for_testing<TEST_FTOKEN>(ts::ctx(scenario));
+        let leverage_treasury_cap = coin::create_treasury_cap_for_testing<TEST_XTOKEN>(ts::ctx(scenario));
+        let reserve_coin = coin::mint_for_testing<TEST_RESERVE>(DEPOSIT_AMOUNT, ts::ctx(scenario));
+
+        // Bind pool to protocol
+        let protocol_id = sui::object::id_from_address(@0x123);
+        stability_pool::bind_pool_to_protocol(&mut pool, &sp_cap, protocol_id);
+
+        let (f_coin, x_coin, admin_cap) = leafsii::init_protocol<TEST_FTOKEN, TEST_XTOKEN, TEST_RESERVE>(
+            stable_treasury_cap,
+            leverage_treasury_cap,
+            INITIAL_PRICE_E6,
+            reserve_coin,
+            &mut pool,
+            &sp_cap,
+            clock,
+            ts::ctx(scenario)
+        );
+
+        ts::return_shared(pool);
+        (f_coin, x_coin, admin_cap, sp_cap)
+    }
+
+    fun setup_test(): (Scenario, Clock, MockOracle<TEST_RESERVE>) {
+        let mut scenario = ts::begin(@0x1);
+        let clock = clock::create_for_testing(ts::ctx(&mut scenario));
+        let oracle = oracle::create_mock_oracle<TEST_RESERVE>(INITIAL_PRICE_E6, &clock, ts::ctx(&mut scenario));
+        
+        (scenario, clock, oracle)
+    }
+
+    #[test]
+    fun test_sp_deposit_and_withdraw_basic() {
+        let (mut scenario, clock, oracle) = setup_test();
+        
+        let (init_f, init_x, admin_cap, sp_cap) = setup_protocol_with_sp(&mut scenario, &clock);
+        
+        ts::next_tx(&mut scenario, @0x1);
+        let mut protocol = ts::take_shared<Protocol<TEST_FTOKEN, TEST_XTOKEN, TEST_RESERVE>>(&scenario);
+        let mut pool = ts::take_shared<StabilityPool<TEST_RESERVE, TEST_FTOKEN>>(&scenario);
+        // Using admin_cap from setup_protocol_with_sp
+        
+        leafsii::update_from_oracle(&mut protocol, &oracle, &clock, &admin_cap);
+        
+        // Create SP position
+        let mut position = stability_pool::create_position<TEST_RESERVE, TEST_FTOKEN>(ts::ctx(&mut scenario));
+        
+        // Deposit F tokens to SP
+        let deposit_amount = 500_000; // 0.5 F
+        let f_token = coin::mint_for_testing<TEST_FTOKEN>(deposit_amount, ts::ctx(&mut scenario));
+        stability_pool::deposit_f(&mut pool, &mut position, f_token, ts::ctx(&mut scenario));
+        
+        // Check position
+        let (f_balance, pending_rewards) = stability_pool::get_user_position_info(&pool, &position);
+        assert!(f_balance == deposit_amount, 0);
+        assert!(pending_rewards == 0, 1); // No rewards yet
+        
+        // Check pool state
+        let sp_total = stability_pool::sp_total_f(&pool);
+        assert!(sp_total == deposit_amount, 2);
+        
+        // Withdraw half
+        let withdraw_amount = deposit_amount / 2;
+        let withdrawn_f = stability_pool::withdraw_f(&mut pool, &mut position, withdraw_amount, ts::ctx(&mut scenario));
+        
+        // Verify withdrawal
+        assert!(coin::value(&withdrawn_f) == withdraw_amount, 3);
+        let (f_balance_after, _) = stability_pool::get_user_position_info(&pool, &position);
+        assert!(f_balance_after == deposit_amount - withdraw_amount, 4);
+        
+        // Cleanup
+        transfer::public_transfer(withdrawn_f, @0x1);
+        transfer::public_transfer(position, @0x1);
+        transfer::public_transfer(init_f, @0x1);
+        transfer::public_transfer(init_x, @0x1);
+        ts::return_shared(protocol);
+        transfer::public_transfer(admin_cap, @0x1);
+        stability_pool::destroy_capability(sp_cap);
+        ts::return_shared(pool);
+        transfer::public_transfer(oracle, @0x1);
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    #[test]
+    fun test_sp_reward_accrual_single_user() {
+        let (mut scenario, clock, oracle) = setup_test();
+        
+        let (init_f, init_x, admin_cap, sp_cap) = setup_protocol_with_sp(&mut scenario, &clock);
+        
+        ts::next_tx(&mut scenario, @0x1);
+        let mut protocol = ts::take_shared<Protocol<TEST_FTOKEN, TEST_XTOKEN, TEST_RESERVE>>(&scenario);
+        let mut pool = ts::take_shared<StabilityPool<TEST_RESERVE, TEST_FTOKEN>>(&scenario);
+        // Using admin_cap from setup_protocol_with_sp
+        
+        leafsii::update_from_oracle(&mut protocol, &oracle, &clock, &admin_cap);
+        
+        // Add more reserve to have enough for operations
+        let extra_reserve = coin::mint_for_testing<TEST_RESERVE>(500_000, ts::ctx(&mut scenario));
+        let _minted = leafsii::mint_f(&mut protocol, &pool, extra_reserve, ts::ctx(&mut scenario));
+        coin::burn_for_testing(_minted);
+        
+        // Create SP position and deposit
+        let mut position = stability_pool::create_position<TEST_RESERVE, TEST_FTOKEN>(ts::ctx(&mut scenario));
+        let deposit_amount = 800_000;
+        let f_token = coin::mint_for_testing<TEST_FTOKEN>(deposit_amount, ts::ctx(&mut scenario));
+        stability_pool::deposit_f(&mut pool, &mut position, f_token, ts::ctx(&mut scenario));
+        
+        // Initial state - no rewards
+        let (_, initial_rewards) = stability_pool::get_user_position_info(&pool, &position);
+        assert!(initial_rewards == 0, 0);
+        
+        let initial_obligations = stability_pool::get_sp_obligation_amount(&pool);
+        assert!(initial_obligations == 0, 1);
+        
+        // Trigger rebalance to create rewards (simulates L3 liquidation)
+        let f_burn_amount = 200_000; // Burn 200K F from SP
+        let r_reward_amount = 100_000; // Index 100K R as rewards
+        let pool_protocol_id = stability_pool::pool_id(&pool);
+        let dummy_cap = stability_pool::create_dummy_capability_with_id(pool_protocol_id, ts::ctx(&mut scenario));
+        let (burned, indexed) = stability_pool::sp_controller_rebalance(&mut pool, &dummy_cap, f_burn_amount, r_reward_amount, ts::ctx(&mut scenario));
+
+        assert!(burned == f_burn_amount, 2);
+        assert!(indexed == r_reward_amount, 3);
+        
+        // Check that obligations increased
+        let new_obligations = stability_pool::get_sp_obligation_amount(&pool);
+        assert!(new_obligations == r_reward_amount, 4);
+        
+        // Check that SP scale shrunk (f tokens are worth less in quantity)
+        let sp_scale = stability_pool::get_sp_scale(&pool);
+        assert!(sp_scale < SCALE_FACTOR, 5); // Scale should have decreased from 1.0
+        
+        // Check user position - f balance should decrease, rewards should appear
+        let (f_balance_after, pending_rewards) = stability_pool::get_user_position_info(&pool, &position);
+        assert!(f_balance_after < deposit_amount, 6); // F balance decreased due to burn
+        assert!(pending_rewards == r_reward_amount, 7); // User gets all rewards (only depositor)
+
+        // Cleanup
+        stability_pool::destroy_capability(dummy_cap);
+        transfer::public_transfer(position, @0x1);
+        transfer::public_transfer(init_f, @0x1);
+        transfer::public_transfer(init_x, @0x1);
+        ts::return_shared(protocol);
+        transfer::public_transfer(admin_cap, @0x1);
+        stability_pool::destroy_capability(sp_cap);
+        ts::return_shared(pool);
+        transfer::public_transfer(oracle, @0x1);
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    #[test]
+    fun test_sp_reward_claiming() {
+        let (mut scenario, clock, oracle) = setup_test();
+        
+        let (init_f, init_x, admin_cap, sp_cap) = setup_protocol_with_sp(&mut scenario, &clock);
+        
+        ts::next_tx(&mut scenario, @0x1);
+        let mut protocol = ts::take_shared<Protocol<TEST_FTOKEN, TEST_XTOKEN, TEST_RESERVE>>(&scenario);
+        let mut pool = ts::take_shared<StabilityPool<TEST_RESERVE, TEST_FTOKEN>>(&scenario);
+        // Using admin_cap from setup_protocol_with_sp
+        
+        leafsii::update_from_oracle(&mut protocol, &oracle, &clock, &admin_cap);
+        
+        // Add extra reserve for operations
+        let extra_reserve = coin::mint_for_testing<TEST_RESERVE>(1_000_000, ts::ctx(&mut scenario));
+        let _minted = leafsii::mint_f(&mut protocol, &pool, extra_reserve, ts::ctx(&mut scenario));
+        coin::burn_for_testing(_minted);
+        
+        // Create SP position and deposit
+        let mut position = stability_pool::create_position<TEST_RESERVE, TEST_FTOKEN>(ts::ctx(&mut scenario));
+        let f_token = coin::mint_for_testing<TEST_FTOKEN>(1_000_000, ts::ctx(&mut scenario));
+        stability_pool::deposit_f(&mut pool, &mut position, f_token, ts::ctx(&mut scenario));
+        
+        // Create rewards via rebalance
+        let reward_amount = 200_000; // 200K R rewards
+        let pool_protocol_id = stability_pool::pool_id(&pool);
+        let dummy_cap = stability_pool::create_dummy_capability_with_id(pool_protocol_id, ts::ctx(&mut scenario));
+        let (_burned, _indexed) = stability_pool::sp_controller_rebalance(&mut pool, &dummy_cap, 400_000, reward_amount, ts::ctx(&mut scenario));
+
+        // Verify pending rewards
+        let (_, pending_rewards) = stability_pool::get_user_position_info(&pool, &position);
+        assert!(pending_rewards == reward_amount, 0);
+        
+        // Check initial protocol reserve
+        let initial_protocol_reserve = leafsii::get_reserve_balance(&protocol);
+        let initial_sp_obligations = stability_pool::get_sp_obligation_amount(&pool);
+        
+        // Claim rewards
+        let claimed_reserve = leafsii::claim_sp_rewards(&mut protocol, &mut pool, &sp_cap, &mut position, ts::ctx(&mut scenario));
+        
+        // Verify claim results
+        assert!(coin::value(&claimed_reserve) == reward_amount, 1);
+        
+        // Check protocol state after claim
+        let final_protocol_reserve = leafsii::get_reserve_balance(&protocol);
+        let final_sp_obligations = stability_pool::get_sp_obligation_amount(&pool);
+        
+        assert!(final_protocol_reserve == initial_protocol_reserve - reward_amount, 2);
+        assert!(final_sp_obligations == initial_sp_obligations - reward_amount, 3);
+        
+        // Check user position after claim (rewards should be 0)
+        let (_, pending_after_claim) = stability_pool::get_user_position_info(&pool, &position);
+        assert!(pending_after_claim == 0, 4);
+
+        // Cleanup
+        stability_pool::destroy_capability(dummy_cap);
+        transfer::public_transfer(claimed_reserve, @0x1);
+        transfer::public_transfer(position, @0x1);
+        transfer::public_transfer(init_f, @0x1);
+        transfer::public_transfer(init_x, @0x1);
+        ts::return_shared(protocol);
+        transfer::public_transfer(admin_cap, @0x1);
+        stability_pool::destroy_capability(sp_cap);
+        ts::return_shared(pool);
+        transfer::public_transfer(oracle, @0x1);
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    #[test]
+    fun test_multiple_users_reward_distribution() {
+        let (mut scenario, clock, oracle) = setup_test();
+        
+        let (init_f, init_x, admin_cap, sp_cap) = setup_protocol_with_sp(&mut scenario, &clock);
+        
+        ts::next_tx(&mut scenario, @0x1);
+        let mut protocol = ts::take_shared<Protocol<TEST_FTOKEN, TEST_XTOKEN, TEST_RESERVE>>(&scenario);
+        let mut pool = ts::take_shared<StabilityPool<TEST_RESERVE, TEST_FTOKEN>>(&scenario);
+        // Using admin_cap from setup_protocol_with_sp
+        
+        leafsii::update_from_oracle(&mut protocol, &oracle, &clock, &admin_cap);
+        
+        // Add extra reserve
+        let extra_reserve = coin::mint_for_testing<TEST_RESERVE>(2_000_000, ts::ctx(&mut scenario));
+        let _minted = leafsii::mint_f(&mut protocol, &pool, extra_reserve, ts::ctx(&mut scenario));
+        coin::burn_for_testing(_minted);
+        
+        // Create first user with 600K F deposit (60% share)
+        let mut position1 = stability_pool::create_position<TEST_RESERVE, TEST_FTOKEN>(ts::ctx(&mut scenario));
+        let f_token1 = coin::mint_for_testing<TEST_FTOKEN>(600_000, ts::ctx(&mut scenario));
+        stability_pool::deposit_f(&mut pool, &mut position1, f_token1, ts::ctx(&mut scenario));
+        
+        // Create second user with 400K F deposit (40% share) 
+        let mut position2 = stability_pool::create_position<TEST_RESERVE, TEST_FTOKEN>(ts::ctx(&mut scenario));
+        let f_token2 = coin::mint_for_testing<TEST_FTOKEN>(400_000, ts::ctx(&mut scenario));
+        stability_pool::deposit_f(&mut pool, &mut position2, f_token2, ts::ctx(&mut scenario));
+        
+        // Total deposited: 1M F tokens
+        let sp_total = stability_pool::sp_total_f(&pool);
+        assert!(sp_total == 1_000_000, 0);
+        
+        // Create rewards via rebalance (300K R total rewards)
+        let total_rewards = 300_000;
+        let pool_protocol_id = stability_pool::pool_id(&pool);
+        let dummy_cap = stability_pool::create_dummy_capability_with_id(pool_protocol_id, ts::ctx(&mut scenario));
+        let (_burned, _indexed) = stability_pool::sp_controller_rebalance(&mut pool, &dummy_cap, 500_000, total_rewards, ts::ctx(&mut scenario));
+
+        // Check reward distribution
+        let (_, rewards1) = stability_pool::get_user_position_info(&pool, &position1);
+        let (_, rewards2) = stability_pool::get_user_position_info(&pool, &position2);
+        
+        // User1 should get 60% of rewards = 180K
+        // User2 should get 40% of rewards = 120K
+        let expected_rewards1 = (total_rewards * 600) / 1000; // 180K
+        let expected_rewards2 = (total_rewards * 400) / 1000; // 120K
+        
+        assert!(rewards1 == expected_rewards1, 1);
+        assert!(rewards2 == expected_rewards2, 2);
+        assert!(rewards1 + rewards2 == total_rewards, 3);
+        
+        // Test claiming by one user
+        let claimed1 = leafsii::claim_sp_rewards(&mut protocol, &mut pool, &sp_cap, &mut position1, ts::ctx(&mut scenario));
+        assert!(coin::value(&claimed1) == expected_rewards1, 4);
+        
+        // User1 should have no more rewards, User2 should still have theirs
+        let (_, rewards1_after) = stability_pool::get_user_position_info(&pool, &position1);
+        let (_, rewards2_after) = stability_pool::get_user_position_info(&pool, &position2);
+        assert!(rewards1_after == 0, 5);
+        assert!(rewards2_after == expected_rewards2, 6);
+        
+        // Test claiming by second user
+        let claimed2 = leafsii::claim_sp_rewards(&mut protocol, &mut pool, &sp_cap, &mut position2, ts::ctx(&mut scenario));
+        assert!(coin::value(&claimed2) == expected_rewards2, 7);
+        
+        // Both users should have no rewards now
+        let (_, final_rewards1) = stability_pool::get_user_position_info(&pool, &position1);
+        let (_, final_rewards2) = stability_pool::get_user_position_info(&pool, &position2);
+        assert!(final_rewards1 == 0, 8);
+        assert!(final_rewards2 == 0, 9);
+
+        // Cleanup
+        stability_pool::destroy_capability(dummy_cap);
+        transfer::public_transfer(claimed1, @0x1);
+        transfer::public_transfer(claimed2, @0x1);
+        transfer::public_transfer(position1, @0x1);
+        transfer::public_transfer(position2, @0x1);
+        transfer::public_transfer(init_f, @0x1);
+        transfer::public_transfer(init_x, @0x1);
+        ts::return_shared(protocol);
+        transfer::public_transfer(admin_cap, @0x1);
+        stability_pool::destroy_capability(sp_cap);
+        ts::return_shared(pool);
+        transfer::public_transfer(oracle, @0x1);
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    #[test]
+    fun test_partial_liquidation_rewards() {
+        let (mut scenario, clock, oracle) = setup_test();
+        
+        let (init_f, init_x, admin_cap, sp_cap) = setup_protocol_with_sp(&mut scenario, &clock);
+        
+        ts::next_tx(&mut scenario, @0x1);
+        let mut protocol = ts::take_shared<Protocol<TEST_FTOKEN, TEST_XTOKEN, TEST_RESERVE>>(&scenario);
+        let mut pool = ts::take_shared<StabilityPool<TEST_RESERVE, TEST_FTOKEN>>(&scenario);
+        // Using admin_cap from setup_protocol_with_sp
+        
+        leafsii::update_from_oracle(&mut protocol, &oracle, &clock, &admin_cap);
+        
+        // Add extra reserve
+        let extra_reserve = coin::mint_for_testing<TEST_RESERVE>(1_500_000, ts::ctx(&mut scenario));
+        let _minted = leafsii::mint_f(&mut protocol, &pool, extra_reserve, ts::ctx(&mut scenario));
+        coin::burn_for_testing(_minted);
+        
+        // Create SP depositor
+        let mut position = stability_pool::create_position<TEST_RESERVE, TEST_FTOKEN>(ts::ctx(&mut scenario));
+        let f_token = coin::mint_for_testing<TEST_FTOKEN>(1_200_000, ts::ctx(&mut scenario));
+        stability_pool::deposit_f(&mut pool, &mut position, f_token, ts::ctx(&mut scenario));
+        
+        // First partial liquidation
+        let reward1 = 100_000;
+        let pool_protocol_id = stability_pool::pool_id(&pool);
+        let dummy_cap1 = stability_pool::create_dummy_capability_with_id(pool_protocol_id, ts::ctx(&mut scenario));
+        let (_burned1, _indexed1) = stability_pool::sp_controller_rebalance(&mut pool, &dummy_cap1, 400_000, reward1, ts::ctx(&mut scenario));
+
+        let (f_balance1, rewards1) = stability_pool::get_user_position_info(&pool, &position);
+        // Allow small rounding difference
+        let diff1 = if (rewards1 > reward1) {
+            rewards1 - reward1
+        } else {
+            reward1 - rewards1
+        };
+        assert!(diff1 <= 1, 0);
+        
+        // Second partial liquidation (without claiming first)
+        let reward2 = 150_000;
+        let dummy_cap2 = stability_pool::create_dummy_capability_with_id(pool_protocol_id, ts::ctx(&mut scenario));
+        let (_burned2, _indexed2) = stability_pool::sp_controller_rebalance(&mut pool, &dummy_cap2, 300_000, reward2, ts::ctx(&mut scenario));
+
+        let (f_balance2, rewards2) = stability_pool::get_user_position_info(&pool, &position);
+        
+        // Total rewards should accumulate (allow small rounding)
+        let expected_total = reward1 + reward2;
+        let diff2 = if (rewards2 > expected_total) {
+            rewards2 - expected_total
+        } else {
+            expected_total - rewards2
+        };
+        assert!(diff2 <= 2, 1);
+        
+        // F balance should decrease with each liquidation due to pro-rata burns
+        assert!(f_balance2 < f_balance1, 2);
+        
+        // Claim all accumulated rewards
+        let claimed_total = leafsii::claim_sp_rewards(&mut protocol, &mut pool, &sp_cap, &mut position, ts::ctx(&mut scenario));
+        let claimed_amount = coin::value(&claimed_total);
+        let expected_claim = reward1 + reward2;
+        let diff3 = if (claimed_amount > expected_claim) {
+            claimed_amount - expected_claim
+        } else {
+            expected_claim - claimed_amount
+        };
+        assert!(diff3 <= 2, 3);
+        
+        // No more rewards should be pending
+        let (_, final_rewards) = stability_pool::get_user_position_info(&pool, &position);
+        assert!(final_rewards == 0, 4);
+        
+        // Third liquidation after claiming
+        let reward3 = 75_000;
+        let dummy_cap3 = stability_pool::create_dummy_capability_with_id(pool_protocol_id, ts::ctx(&mut scenario));
+        let (_burned3, _indexed3) = stability_pool::sp_controller_rebalance(&mut pool, &dummy_cap3, 200_000, reward3, ts::ctx(&mut scenario));
+
+        let (_, rewards3) = stability_pool::get_user_position_info(&pool, &position);
+        assert!(rewards3 == reward3, 5); // Only new rewards
+        
+        // Cleanup
+        stability_pool::destroy_capability(dummy_cap1);
+        stability_pool::destroy_capability(dummy_cap2);
+        stability_pool::destroy_capability(dummy_cap3);
+        transfer::public_transfer(claimed_total, @0x1);
+        transfer::public_transfer(position, @0x1);
+        transfer::public_transfer(init_f, @0x1);
+        transfer::public_transfer(init_x, @0x1);
+        ts::return_shared(protocol);
+        transfer::public_transfer(admin_cap, @0x1);
+        stability_pool::destroy_capability(sp_cap);
+        ts::return_shared(pool);
+        transfer::public_transfer(oracle, @0x1);
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    #[test]
+    fun test_yield_harvest_bounty() {
+        let (mut scenario, clock, oracle) = setup_test();
+
+        let (init_f, init_x, admin_cap, sp_cap) = setup_protocol_with_sp(&mut scenario, &clock);
+        
+        ts::next_tx(&mut scenario, @0x1);
+        let protocol = ts::take_shared<Protocol<TEST_FTOKEN, TEST_XTOKEN, TEST_RESERVE>>(&scenario);
+        let mut pool = ts::take_shared<StabilityPool<TEST_RESERVE, TEST_FTOKEN>>(&scenario);
+        // Using admin_cap from setup_protocol_with_sp
+        
+        // Create SP depositor
+        let mut position = stability_pool::create_position<TEST_RESERVE, TEST_FTOKEN>(ts::ctx(&mut scenario));
+        let f_token = coin::mint_for_testing<TEST_FTOKEN>(1_000_000, ts::ctx(&mut scenario));
+        stability_pool::deposit_f(&mut pool, &mut position, f_token, ts::ctx(&mut scenario));
+        
+        // Test yield harvest with 1% bounty
+        let yield_amount = 100_000; // 100K R yield
+        let yield_coin = coin::mint_for_testing<TEST_RESERVE>(yield_amount, ts::ctx(&mut scenario));
+        let pool_protocol_id = stability_pool::pool_id(&pool);
+        let dummy_cap = stability_pool::create_dummy_capability_with_id(pool_protocol_id, ts::ctx(&mut scenario));
+        let bounty = stability_pool::sp_index_harvest(&mut pool, &dummy_cap, yield_coin, ts::ctx(&mut scenario));
+
+        // Function now returns the full yield amount to let caller handle splitting
+        assert!(coin::value(&bounty) == yield_amount, 0);
+
+        // The indexed amount should be 99% of the original yield
+        let expected_indexed = yield_amount - (yield_amount / 100);
+        let sp_obligations = stability_pool::get_sp_obligation_amount(&pool);
+        assert!(sp_obligations == expected_indexed, 1);
+
+        // User should see the indexed amount as rewards
+        let (_, user_rewards) = stability_pool::get_user_position_info(&pool, &position);
+        assert!(user_rewards == expected_indexed, 2);
+
+        // Test with no depositors (should return 0 bounty)
+        // Note: create_stability_pool creates a shared object, so we can't test empty pool this way
+        // We'll just verify that pool with no depositors would return 0 bounty in separate test
+
+        // Cleanup
+        stability_pool::destroy_capability(dummy_cap);
+        transfer::public_transfer(bounty, @0x1);
+        transfer::public_transfer(position, @0x1);
+        transfer::public_transfer(init_f, @0x1);
+        transfer::public_transfer(init_x, @0x1);
+        transfer::public_transfer(admin_cap, @0x1);
+        stability_pool::destroy_capability(sp_cap);
+        ts::return_shared(protocol);
+        ts::return_shared(pool);
+        transfer::public_transfer(oracle, @0x1);
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = leafsii::E_INVALID_AMOUNT)]
+    fun test_claim_with_no_rewards_fails() {
+        let (mut scenario, clock, oracle) = setup_test();
+        
+        let (init_f, init_x, admin_cap, sp_cap) = setup_protocol_with_sp(&mut scenario, &clock);
+        
+        ts::next_tx(&mut scenario, @0x1);
+        let mut protocol = ts::take_shared<Protocol<TEST_FTOKEN, TEST_XTOKEN, TEST_RESERVE>>(&scenario);
+        let mut pool = ts::take_shared<StabilityPool<TEST_RESERVE, TEST_FTOKEN>>(&scenario);
+        // Using admin_cap from setup_protocol_with_sp
+        
+        // Create SP position but don't create any rewards
+        let mut position = stability_pool::create_position<TEST_RESERVE, TEST_FTOKEN>(ts::ctx(&mut scenario));
+        let f_token = coin::mint_for_testing<TEST_FTOKEN>(500_000, ts::ctx(&mut scenario));
+        stability_pool::deposit_f(&mut pool, &mut position, f_token, ts::ctx(&mut scenario));
+        
+        // Try to claim with no rewards - should fail
+        let _claimed = leafsii::claim_sp_rewards(&mut protocol, &mut pool, &sp_cap, &mut position, ts::ctx(&mut scenario));
+        
+        // Cleanup (won't reach here)
+        transfer::public_transfer(position, @0x1);
+        transfer::public_transfer(init_f, @0x1);
+        transfer::public_transfer(init_x, @0x1);
+        ts::return_shared(protocol);
+        transfer::public_transfer(admin_cap, @0x1);
+        stability_pool::destroy_capability(sp_cap);
+        ts::return_shared(pool);
+        transfer::public_transfer(oracle, @0x1);
+        transfer::public_transfer(_claimed, @0x1);
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    #[test]
+    fun test_sp_burn_cap_limits() {
+        let (mut scenario, clock, oracle) = setup_test();
+        
+        let (init_f, init_x, admin_cap, sp_cap) = setup_protocol_with_sp(&mut scenario, &clock);
+
+        ts::next_tx(&mut scenario, @0x1);
+        let protocol = ts::take_shared<Protocol<TEST_FTOKEN, TEST_XTOKEN, TEST_RESERVE>>(&scenario);
+        let mut pool = ts::take_shared<StabilityPool<TEST_RESERVE, TEST_FTOKEN>>(&scenario);
+        // Using admin_cap from setup_protocol_with_sp
+        
+        // Create large SP deposit (1M F)
+        let mut position = stability_pool::create_position<TEST_RESERVE, TEST_FTOKEN>(ts::ctx(&mut scenario));
+        let f_token = coin::mint_for_testing<TEST_FTOKEN>(1_000_000, ts::ctx(&mut scenario));
+        stability_pool::deposit_f(&mut pool, &mut position, f_token, ts::ctx(&mut scenario));
+        
+        let total_f = stability_pool::sp_total_f(&pool);
+        let burn_cap = stability_pool::sp_quote_burn_cap(&pool);
+        
+        // Burn cap should be 50% of total (SP_MAX_BURN_FRAC_CALL = 5000 BPS = 50%)
+        let expected_cap = total_f / 2;
+        assert!(burn_cap == expected_cap, 0);
+        
+        // Try to burn more than cap - should be limited
+        let excessive_burn = total_f; // Try to burn 100%
+        let excessive_reward = 500_000;
+        let pool_protocol_id = stability_pool::pool_id(&pool);
+        let dummy_cap = stability_pool::create_dummy_capability_with_id(pool_protocol_id, ts::ctx(&mut scenario));
+        let (actual_burn, actual_reward) = stability_pool::sp_controller_rebalance(
+            &mut pool,
+            &dummy_cap,
+            excessive_burn,
+            excessive_reward,
+            ts::ctx(&mut scenario)
+        );
+
+        // Should be capped at 50%
+        assert!(actual_burn == burn_cap, 1);
+        
+        // Reward should be proportionally scaled
+        let expected_reward = (excessive_reward * burn_cap) / excessive_burn;
+        assert!(actual_reward == expected_reward, 2);
+        
+        // Cleanup
+        stability_pool::destroy_capability(dummy_cap);
+        transfer::public_transfer(position, @0x1);
+        transfer::public_transfer(init_f, @0x1);
+        transfer::public_transfer(init_x, @0x1);
+        ts::return_shared(protocol);
+        transfer::public_transfer(admin_cap, @0x1);
+        stability_pool::destroy_capability(sp_cap);
+        ts::return_shared(pool);
+        transfer::public_transfer(oracle, @0x1);
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+}

@@ -1,0 +1,11 @@
+[package]
+name = "leafsii-core"
+version = "1.0.0"
+edition = "2024.beta"
+
+[dependencies]
+
+[addresses]
+leafsii = "0x0"
+oracle = "0x0"
+math = "0x0"

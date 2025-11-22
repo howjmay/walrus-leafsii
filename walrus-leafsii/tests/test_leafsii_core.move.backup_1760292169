@@ -1,0 +1,307 @@
+#[test_only]
+module leafsii::test_leafsii_core {
+    use sui::clock::{Self, Clock};
+    use sui::coin::{Self};
+    use sui::test_scenario::{Self as ts, Scenario};
+
+    use oracle::oracle::{Self, MockOracle};
+    use leafsii::leafsii::{Self};
+    use leafsii::stability_pool::{Self};
+    use std::debug;
+    use sui_system::staking_pool::FungibleStakedSui;
+    use sui::sui::SUI;
+
+    // Test asset types
+    public struct TEST_FTOKEN has drop {}
+    public struct TEST_XTOKEN has drop {}
+
+    const INITIAL_PRICE_E6: u64 = 2_000_000; // $2.00
+    const DEPOSIT_AMOUNT: u64 = 1_000_000; // 1 TEST_RESERVE
+    
+    fun setup_test(): (Scenario, Clock, MockOracle<SUI>) {
+        let mut scenario = ts::begin(@0x1);
+        let ctx = ts::ctx(&mut scenario);
+        
+        let clock = clock::create_for_testing(ctx);
+        let oracle = oracle::create_mock_oracle<SUI>(INITIAL_PRICE_E6, &clock, ctx);
+        
+        (scenario, clock, oracle)
+    }
+
+    fun setup_protocol_with_pool(
+        scenario: &mut Scenario,
+        clock: &Clock
+    ): (coin::Coin<TEST_FTOKEN>, coin::Coin<TEST_XTOKEN>, leafsii::AdminCap) {
+        let ctx = ts::ctx(scenario);
+
+        // Create stability pool first
+        let sp_cap = stability_pool::create_stability_pool<TEST_FTOKEN>(ctx);
+
+        ts::next_tx(scenario, @0x1);
+        let mut pool = ts::take_shared<stability_pool::StabilityPool<TEST_FTOKEN>>(scenario);
+
+        // Create protocol with pool reference
+        let stable_treasury_cap = coin::create_treasury_cap_for_testing<TEST_FTOKEN>(ts::ctx(scenario));
+        let leverage_treasury_cap = coin::create_treasury_cap_for_testing<TEST_XTOKEN>(ts::ctx(scenario));
+        let reserve_coin = coin::mint_for_testing<SUI>(DEPOSIT_AMOUNT, ts::ctx(scenario));
+        // Bind pool to protocol
+        let protocol_id = sui::object::id_from_address(@0x123);
+
+        let (coin_f, coin_x, admin_cap) = leafsii::init_protocol<TEST_FTOKEN, TEST_XTOKEN>(
+            stable_treasury_cap,
+            leverage_treasury_cap,
+            INITIAL_PRICE_E6,
+            reserve_coin,
+            &mut pool,
+            sp_cap,
+            clock,
+            ts::ctx(scenario)
+        );
+
+        ts::return_shared(pool);
+
+        (coin_f, coin_x, admin_cap)
+    }
+
+    #[test]
+    fun test_protocol_initialization() {
+        let (mut scenario, clock, oracle) = setup_test();
+        let (coin_f, coin_x, admin_cap) = setup_protocol_with_pool(&mut scenario, &clock);
+
+        ts::next_tx(&mut scenario, @0x1);
+        let protocol = ts::take_shared<leafsii::Protocol<TEST_FTOKEN, TEST_XTOKEN>>(&scenario);
+
+        let (nf, nx, pf, px, p_r, reserve, fees, allow_actions) =
+            leafsii::get_protocol_state<TEST_FTOKEN, TEST_XTOKEN>(&protocol);
+
+        assert!(nf == 1_000, 0); // Changed from 1_000_000 due to PF_FIXED = 1e9
+        assert!(nx == 500_000, 1);
+        assert!(pf == 1_000_000_000, 2); // $1.00 in nano-USD (1e9), not micro-USD
+        assert!(px == INITIAL_PRICE_E6, 3);
+        assert!(p_r == INITIAL_PRICE_E6, 4);
+        assert!(reserve == DEPOSIT_AMOUNT, 5);
+        assert!(fees == 0, 6);
+        assert!(allow_actions == true, 7);
+
+        // Cleanup
+        ts::return_shared(protocol);
+        transfer::public_transfer(admin_cap, @0x1);
+        transfer::public_transfer(oracle, @0x1);
+        transfer::public_transfer(coin_f, @0x1);
+        transfer::public_transfer(coin_x, @0x1);
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    #[test]
+    fun test_protocol_initialization_with_reserve_50_50() {
+        let (mut scenario, clock, oracle) = setup_test();
+        let (coin_f, coin_x, admin_cap) = setup_protocol_with_pool(&mut scenario, &clock);
+
+        ts::next_tx(&mut scenario, @0x1);
+        let protocol = ts::take_shared<leafsii::Protocol<TEST_FTOKEN, TEST_XTOKEN>>(&scenario);
+
+        // Expect 50/50 USD split: $1.0 to F -> 0.001 F minted (nano-USD); $1.0 to X -> 0.5 X minted at px=$2.0
+        let (nf, nx, pf, px, p_r, reserve, _, _) = leafsii::get_protocol_state<TEST_FTOKEN, TEST_XTOKEN>(&protocol);
+        assert!(pf == 1_000_000_000, 0); // Changed from 1_000_000, now in nano-USD (1e9)
+        assert!(p_r == INITIAL_PRICE_E6, 1);
+        assert!(reserve == DEPOSIT_AMOUNT, 2);
+        assert!(px == INITIAL_PRICE_E6 / 1, 3);
+        assert!(nf == 1_000, 4); // Changed from 1_000_000 due to PF_FIXED = 1e9
+        assert!(nx == 500_000, 5);   // $1.0 / $2.0 = 0.5 X
+
+        // Invariant should hold
+        assert!(leafsii::check_invariant<TEST_FTOKEN, TEST_XTOKEN>(&protocol), 6);
+
+        // Cleanup
+        ts::return_shared(protocol);
+        transfer::public_transfer(admin_cap, @0x1);
+        transfer::public_transfer(oracle, @0x1);
+        transfer::public_transfer(coin_f, @0x1);
+        transfer::public_transfer(coin_x, @0x1);
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    #[test]
+    fun test_oracle_update() {
+        let (mut scenario, clock, mut oracle) = setup_test();
+        let (coin_f, coin_x, admin_cap) = setup_protocol_with_pool(&mut scenario, &clock);
+
+        ts::next_tx(&mut scenario, @0x1);
+        let mut protocol = ts::take_shared<leafsii::Protocol<TEST_FTOKEN, TEST_XTOKEN>>(&scenario);
+        // Using admin_cap from init_protocol
+
+        // Test price update
+        let new_price = 2_200_000; // $2.20 (10% increase)
+        oracle::update_mock_price(&mut oracle, new_price, &clock);
+        leafsii::update_from_oracle<TEST_FTOKEN, TEST_XTOKEN>(&mut protocol, &oracle, &clock, &admin_cap);
+
+        let (_, _, _, _, p_r, _, _, _) = leafsii::get_protocol_state<TEST_FTOKEN, TEST_XTOKEN>(&protocol);
+        assert!(p_r == new_price, 0);
+
+        // Cleanup
+        ts::return_shared(protocol);
+        transfer::public_transfer(admin_cap, @0x1);
+        transfer::public_transfer(oracle, @0x1);
+        transfer::public_transfer(coin_f, @0x1);
+        transfer::public_transfer(coin_x, @0x1);
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    #[test]
+    fun test_mint_and_redeem_f_tokens() {
+        let (mut scenario, clock, oracle) = setup_test();
+        let (coin_f, coin_x, admin_cap) = setup_protocol_with_pool(&mut scenario, &clock);
+
+        ts::next_tx(&mut scenario, @0x1);
+        let mut protocol = ts::take_shared<leafsii::Protocol<TEST_FTOKEN, TEST_XTOKEN>>(&scenario);
+        let pool = ts::take_shared<stability_pool::StabilityPool<TEST_FTOKEN>>(&scenario);
+        // Using admin_cap from init_protocol
+
+        // Update oracle first
+        leafsii::update_from_oracle<TEST_FTOKEN, TEST_XTOKEN>(&mut protocol, &oracle, &clock, &admin_cap);
+
+        // Check initial state before minting
+        let (_initial_nf_supply, _, _, _, _, initial_reserve_balance, _, _) = leafsii::get_protocol_state<TEST_FTOKEN, TEST_XTOKEN>(&protocol);
+
+        // Create test reserve coin
+        let test_coin = coin::mint_for_testing<SUI>(DEPOSIT_AMOUNT, ts::ctx(&mut scenario));
+
+        // Test minting F tokens - with 0.5% fee, user gets 1,990 F tokens (changed due to PF_FIXED = 1e9)
+        let coin_f2 = leafsii::mint_f<TEST_FTOKEN, TEST_XTOKEN>(&mut protocol, &pool, test_coin, ts::ctx(&mut scenario));
+        assert!(&coin_f2.value() == 1_990, 0); // Changed from 1_990_000 due to PF_FIXED = 1e9
+
+        // Check protocol state after minting - protocol supply increases by net amount after fee
+        let (nf_supply, _, _, _, _, reserve_balance, _, _) = leafsii::get_protocol_state<TEST_FTOKEN, TEST_XTOKEN>(&protocol);
+        assert!(nf_supply == 2_990, 0); // Changed from 2_990_000 due to PF_FIXED = 1e9
+        assert!(reserve_balance == initial_reserve_balance + 995_000, 1); // Initial + net deposit after fee
+
+        // For redemption test, we need to create a separate coin for testing purposes
+        // In a real scenario, these would be the tokens received from minting
+        let coin_r = leafsii::redeem_f<TEST_FTOKEN, TEST_XTOKEN>(&mut protocol, &pool, coin_f2, ts::ctx(&mut scenario));
+        debug::print(&coin_r.value());
+
+        // Check state after redemption - reserve calculation:
+        // Initial: DEPOSIT_AMOUNT (1.0R) -> splits to 0.5R worth F + 0.5R worth X
+        // After mint: +DEPOSIT_AMOUNT (1.0R) -> total 2.0R, 1.5R worth F + 0.5R worth X  
+        // After redeem F: -1.0R (2.0F / $2 per F) -> final 1.0R
+        let (_nf_supply_after, _, _, _, _, reserve_after, _, _) = leafsii::get_protocol_state<TEST_FTOKEN, TEST_XTOKEN>(&protocol);
+        assert!(reserve_after == DEPOSIT_AMOUNT, 2);
+
+        // Cleanup
+        ts::return_shared(protocol);
+        ts::return_shared(pool);
+        transfer::public_transfer(admin_cap, @0x1);
+        transfer::public_transfer(oracle, @0x1);
+        transfer::public_transfer(coin_f, @0x1);
+        // transfer::public_transfer(coin_f2, @0x1);
+        transfer::public_transfer(coin_x, @0x1);
+        transfer::public_transfer(coin_r, @0x1);
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    #[test]
+    fun test_mint_and_redeem_x_tokens() {
+        let (mut scenario, clock, oracle) = setup_test();
+        let (coin_f, coin_x, admin_cap) = setup_protocol_with_pool(&mut scenario, &clock);
+
+        ts::next_tx(&mut scenario, @0x1);
+        let mut protocol = ts::take_shared<leafsii::Protocol<TEST_FTOKEN, TEST_XTOKEN>>(&scenario);
+        let pool = ts::take_shared<stability_pool::StabilityPool<TEST_FTOKEN>>(&scenario);
+        // Using admin_cap from init_protocol
+
+        // Update oracle first
+        leafsii::update_from_oracle(&mut protocol, &oracle, &clock, &admin_cap);
+
+        // Create test reserve coin
+        let test_coin = coin::mint_for_testing<SUI>(DEPOSIT_AMOUNT, ts::ctx(&mut scenario));
+
+        // Test minting X tokens
+        let coin_x2 = leafsii::mint_x(&mut protocol, &pool, test_coin, ts::ctx(&mut scenario));
+        
+        // Check protocol state after minting
+        let (_, nx_supply, _, px, _, reserve_balance, _, _) = leafsii::get_protocol_state<TEST_FTOKEN, TEST_XTOKEN>(&protocol);
+        assert!(nx_supply > 0, 0);
+        assert!(px > 0, 1); // px should be set after minting
+        assert!(reserve_balance == DEPOSIT_AMOUNT + 995_000, 2); // Initial + net deposit after 0.5% fee
+
+        // Test redeeming X tokens - using test tokens for simplicity
+        let x_coin = coin::mint_for_testing<TEST_XTOKEN>(nx_supply / 2, ts::ctx(&mut scenario)); // Redeem half
+        let coin_r = leafsii::redeem_x(&mut protocol, &pool, x_coin, ts::ctx(&mut scenario));
+        
+        // Check state after redemption - reserve should decrease from post-mint level
+        let (_, _, _, _, _, reserve_after, _, _) = leafsii::get_protocol_state<TEST_FTOKEN, TEST_XTOKEN>(&protocol);
+        assert!(reserve_after < reserve_balance, 3);
+
+        // Cleanup
+        ts::return_shared(protocol);
+        ts::return_shared(pool);
+        transfer::public_transfer(admin_cap, @0x1);
+        transfer::public_transfer(oracle, @0x1);
+        transfer::public_transfer(coin_f, @0x1);
+        transfer::public_transfer(coin_x, @0x1);
+        transfer::public_transfer(coin_x2, @0x1);
+        transfer::public_transfer(coin_r, @0x1);
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    #[test]
+    fun test_admin_functions() {
+        let (mut scenario, clock, oracle) = setup_test();
+        let (coin_f, coin_x, admin_cap) = setup_protocol_with_pool(&mut scenario, &clock);
+
+        ts::next_tx(&mut scenario, @0x1);
+        let mut protocol = ts::take_shared<leafsii::Protocol<TEST_FTOKEN, TEST_XTOKEN>>(&scenario);
+        // Using admin_cap from init_protocol
+
+        // Test setting user actions
+        leafsii::set_user_actions_allowed(&mut protocol, false, &admin_cap);
+        let (_, _, _, _, _, _, _, allow_actions) = leafsii::get_protocol_state<TEST_FTOKEN, TEST_XTOKEN>(&protocol);
+        assert!(allow_actions == false, 0);
+
+        // Test fee configuration
+        leafsii::set_fee_config(&mut protocol, 100, 150, 75, 125, 200, 20, &admin_cap);
+        let (mint_f_fee, mint_x_fee, redeem_f_fee, redeem_x_fee, l1_redeem_x_fee, bonus_rate, _) = 
+            leafsii::get_fee_config(&protocol);
+        assert!(mint_f_fee == 100, 1);
+        assert!(mint_x_fee == 150, 2);
+        assert!(redeem_f_fee == 75, 3);
+        assert!(redeem_x_fee == 125, 4);
+        assert!(l1_redeem_x_fee == 200, 5);
+        assert!(bonus_rate == 20, 6);
+
+        // Cleanup
+        ts::return_shared(protocol);
+        transfer::public_transfer(admin_cap, @0x1);
+        transfer::public_transfer(oracle, @0x1);
+        transfer::public_transfer(coin_f, @0x1);
+        transfer::public_transfer(coin_x, @0x1);
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+
+    #[test] 
+    fun test_invariant_checks() {
+        let (mut scenario, clock, oracle) = setup_test();
+        let (coin_f, coin_x, admin_cap) = setup_protocol_with_pool(&mut scenario, &clock);
+
+        ts::next_tx(&mut scenario, @0x1);
+        let protocol = ts::take_shared<leafsii::Protocol<TEST_FTOKEN, TEST_XTOKEN>>(&scenario);
+
+        // Test initial invariant (should hold with zero values)
+        assert!(leafsii::check_invariant<TEST_FTOKEN, TEST_XTOKEN>(&protocol), 0);
+
+        // Cleanup
+        ts::return_shared(protocol);
+        transfer::public_transfer(admin_cap, @0x1);
+        transfer::public_transfer(oracle, @0x1);
+        transfer::public_transfer(coin_f, @0x1);
+        transfer::public_transfer(coin_x, @0x1);
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
+}

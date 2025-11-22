@@ -1,0 +1,98 @@
+#[test_only]
+module leafsii::test_security_fix {
+    use sui::test_scenario as ts;
+    use sui_system::staking_pool::FungibleStakedSui;
+    use leafsii::stability_pool::{Self, StabilityPool};
+
+    // Test types
+    public struct TEST_FTOKEN has drop {}
+
+    #[test, expected_failure]
+    fun test_cannot_create_unauthorized_sp_controller_rebalance() {
+        let mut scenario = ts::begin(@0x1);
+        let ctx = ts::ctx(&mut scenario);
+        
+        // Create a protocol ID for pool
+        let _protocol_id = object::id_from_address(@0x123);
+        
+        // Create stability pool 
+        let sp_controller_cap = stability_pool::create_stability_pool<TEST_FTOKEN>(ctx);
+        
+        ts::next_tx(&mut scenario, @0x2); // Switch to different user
+        let mut pool = ts::take_shared<StabilityPool<TEST_FTOKEN>>(&scenario);
+        
+        // Try to create fake capability with wrong protocol ID
+        let fake_protocol_id = sui::object::id_from_address(@0x999);
+        let fake_cap = stability_pool::create_dummy_capability_with_id(fake_protocol_id, ts::ctx(&mut scenario));
+        
+        // This should fail - unauthorized controller access
+        let (_burned, _indexed) = stability_pool::sp_controller_rebalance(
+            &mut pool,
+            &fake_cap,  // Wrong capability!
+            100_000,
+            50_000
+        );
+
+        // Cleanup
+        stability_pool::destroy_capability(sp_controller_cap);
+        stability_pool::destroy_capability(fake_cap);
+        ts::return_shared(pool);
+        ts::end(scenario);
+    }
+
+    #[test, expected_failure] 
+    fun test_cannot_decrease_obligation_without_capability() {
+        let mut scenario = ts::begin(@0x1);
+        let ctx = ts::ctx(&mut scenario);
+        
+        // Create a protocol ID for pool
+        let _protocol_id = object::id_from_address(@0x123);
+        
+        // Create stability pool with proper cap
+        let sp_controller_cap = stability_pool::create_stability_pool<TEST_FTOKEN>(ctx);
+        
+        ts::next_tx(&mut scenario, @0x2); // Switch to different user
+        let mut pool = ts::take_shared<StabilityPool<TEST_FTOKEN>>(&scenario);
+        
+        // Try to create fake capability
+        let fake_protocol_id = sui::object::id_from_address(@0x999);
+        let fake_cap = stability_pool::create_dummy_capability_with_id(fake_protocol_id, ts::ctx(&mut scenario));
+        
+        // This should fail - unauthorized controller access
+        stability_pool::decrease_obligation(&mut pool, &fake_cap, 1000);
+
+        // Cleanup
+        stability_pool::destroy_capability(sp_controller_cap);
+        stability_pool::destroy_capability(fake_cap);
+        ts::return_shared(pool);
+        ts::end(scenario);
+    }
+
+    #[test]
+    fun test_authorized_access_works() {
+        let mut scenario = ts::begin(@0x1);
+        let ctx = ts::ctx(&mut scenario);
+        
+        // Create a protocol ID for pool
+        let _protocol_id = object::id_from_address(@0x123);
+        
+        // Create stability pool with proper cap
+        let sp_controller_cap = stability_pool::create_stability_pool<TEST_FTOKEN>(ctx);
+        
+        ts::next_tx(&mut scenario, @0x1); // Stay as same user who has the cap
+        let mut pool = ts::take_shared<StabilityPool<TEST_FTOKEN>>(&scenario);
+        
+        // This should work - authorized access with proper capability
+        let (_burned, _indexed) = stability_pool::sp_controller_rebalance(
+            &mut pool,
+            &sp_controller_cap,  // Correct capability!
+            0, // Small burn amount
+            0
+        );
+
+        // Cleanup
+        stability_pool::destroy_capability(sp_controller_cap);
+        ts::return_shared(pool);
+        ts::end(scenario);
+    }
+}

@@ -1,0 +1,9 @@
+{
+  "eth": {
+    "vaultAddress": "0x5D54bdA7C9Aa3a1F9bEfe0966CBB899FbA43c274",
+    "network": "https://ethereum-sepolia.publicnode.com",
+    "monitorAddress": "0x0000000000000000000000000000000000000000"
+  },
+  "depositTx": "0x4f115c90cc3727651a8fc470a587af4194841361d851924c10003483ddee381f",
+  "updatedAt": "2025-11-21T17:54:01.210184Z"
+}

@@ -1,0 +1,8 @@
+.claude/
+tmp/
+backend/bin/
+backend/vendor/
+indexer
+init.json
+node_modules/
+.env

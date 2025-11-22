@@ -1,0 +1,54 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { 
+  color-scheme: dark; 
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(1200px 600px at 80% -10%, rgba(139,92,246,.15), transparent 60%),
+    radial-gradient(1000px 800px at 10% 20%, rgba(96,165,250,.10), transparent 60%),
+    linear-gradient(180deg, #0B0F1A 0%, #121528 100%);
+  background-attachment: fixed;
+  color: #E5E7EB;
+  font-family: Inter, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+@layer components {
+  .card {
+    @apply bg-bg-card/90 backdrop-blur-md rounded-2xl shadow-card border border-border-subtle;
+  }
+  
+  .card--elevated { 
+    @apply bg-bg-card2/90 shadow-glow; 
+  }
+  
+  .input {
+    @apply bg-bg-input border border-border-subtle rounded-xl px-4 py-3 text-text-primary placeholder:text-text-muted focus:border-border-focus focus:outline-none transition-colors;
+  }
+
+  .btn-primary {
+    @apply h-12 w-full rounded-xl bg-brand-primary text-text-onBrand font-semibold shadow-glow transition hover:opacity-95 focus:outline-none focus:ring-2 focus:ring-border-focus disabled:opacity-55 disabled:cursor-not-allowed;
+  }
+
+  .btn-secondary {
+    @apply h-12 w-full rounded-xl bg-bg-card border border-border-subtle text-text-primary font-semibold transition hover:bg-bg-card2 focus:outline-none focus:ring-2 focus:ring-border-focus disabled:opacity-55 disabled:cursor-not-allowed;
+  }
+
+  .tab-active {
+    @apply text-brand-primary border-b-2 border-brand-primary;
+  }
+
+  .tab-inactive {
+    @apply text-text-secondary border-b-2 border-transparent hover:text-text-primary transition-colors;
+  }
+}
